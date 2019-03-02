@@ -22,14 +22,14 @@ import RxSwift
  - parameter effects: The request effects.
  - returns: The feedback loop performing the effects.
  */
-public func react<State, Request: Equatable, Event>(
+public func react<State, Request: Equatable, Event, Context>(
     request: @escaping (State) -> Request?,
-    effects: @escaping (Request) -> Observable<Event>
-) -> (ObservableSchedulerContext<State>) -> Observable<Event> {
+    effects: @escaping (Request, Context) -> Observable<Event>
+) -> (ObservableSchedulerContext<State>, Context) -> Observable<Event> {
     return react(
         requests: { request($0).map { value in [ConstHashable(value: value): value] } ?? [:] },
-        effects: { initialValue, _ in
-            return effects(initialValue)
+        effects: { initialValue, _, context in
+            return effects(initialValue, context)
         }
     )
 }
@@ -47,16 +47,16 @@ public func react<State, Request: Equatable, Event>(
  - parameter effects: The request effects.
  - returns: The feedback loop performing the effects.
  */
-public func react<State, Request: Equatable, Event>(
+public func react<State, Request: Equatable, Event, Context>(
     request: @escaping (State) -> Request?,
-    effects: @escaping (Request) -> Signal<Event>
-) -> (Driver<State>) -> Signal<Event> {
-    return { state in
+    effects: @escaping (Request, Context) -> Signal<Event>
+) -> (Driver<State>, Context) -> Signal<Event> {
+    return { state, context in
         let observableSchedulerContext = ObservableSchedulerContext<State>(
             source: state.asObservable(),
             scheduler: Signal<Event>.SharingStrategy.scheduler.async
         )
-        return react(request: request, effects: { effects($0).asObservable() })(observableSchedulerContext)
+        return react(request: request, effects: { effects($0, $1).asObservable() })(observableSchedulerContext, context)
             .asSignal(onErrorSignalWith: .empty()) }
 }
 
@@ -74,14 +74,14 @@ public func react<State, Request: Equatable, Event>(
  - parameter effects: The request effects.
  - returns: The feedback loop performing the effects.
  */
-public func react<State, Request, Event>(
+public func react<State, Request, Event, Context>(
     requests: @escaping (State) -> Set<Request>,
-    effects: @escaping (Request) -> Observable<Event>
-) -> (ObservableSchedulerContext<State>) -> Observable<Event> {
+    effects: @escaping (Request, Context) -> Observable<Event>
+) -> (ObservableSchedulerContext<State>, Context) -> Observable<Event> {
     return react(
         requests: { Dictionary(requests($0).map { ($0, $0) }, uniquingKeysWith: { first, _ in first }) },
-        effects: { initialValue, _ in
-            return effects(initialValue)
+        effects: { initialValue, _, context in
+            return effects(initialValue, context)
         })
 }
 
@@ -99,22 +99,22 @@ public func react<State, Request, Event>(
  - parameter effects: The request effects.
  - returns: The feedback loop performing the effects.
  */
-public func react<State, Request, Event>(
+public func react<State, Request, Event, Context>(
     requests: @escaping (State) -> Set<Request>,
-    effects: @escaping (Request) -> Signal<Event>
-) -> (Driver<State>) -> Signal<Event> {
-    return { (state: Driver<State>) -> Signal<Event> in
+    effects: @escaping (Request, Context) -> Signal<Event>
+) -> (Driver<State>, Context) -> Signal<Event> {
+    return { (state: Driver<State>, context) -> Signal<Event> in
         let observableSchedulerContext = ObservableSchedulerContext<State>(
             source: state.asObservable(),
             scheduler: Signal<Event>.SharingStrategy.scheduler.async
         )
-        return react(requests: requests, effects: { effects($0).asObservable() })(observableSchedulerContext)
+        return react(requests: requests, effects: { effects($0, $1).asObservable() })(observableSchedulerContext, context)
             .asSignal(onErrorSignalWith: .empty())
     }
 }
 
 /// This is defined outside of `react` because Swift compiler generates an `error` :(.
-fileprivate class RequestLifetimeTracking<Request: Equatable, RequestID: Hashable, Event> {
+fileprivate class RequestLifetimeTracking<Request: Equatable, RequestID: Hashable, Event, Context> {
     class LifetimeToken {}
 
     let state = AsyncSynchronized(
@@ -130,18 +130,21 @@ fileprivate class RequestLifetimeTracking<Request: Equatable, RequestID: Hashabl
         latestRequest: BehaviorSubject<Request>
     )
 
-    let effects: (_ initial: Request, _ state: Observable<Request>) -> Observable<Event>
+    let effects: (_ initial: Request, _ state: Observable<Request>, _ context: Context) -> Observable<Event>
     let scheduler: ImmediateSchedulerType
     let observer: AnyObserver<Event>
+    let context: Context
 
     init(
-        effects: @escaping (_ initial: Request, _ state: Observable<Request>) -> Observable<Event>,
+        effects: @escaping (_ initial: Request, _ state: Observable<Request>, _ context: Context) -> Observable<Event>,
         scheduler: ImmediateSchedulerType,
-        observer: AnyObserver<Event>
+        observer: AnyObserver<Event>,
+        context: Context
     ) {
         self.effects = effects
         self.scheduler = scheduler
         self.observer = observer
+        self.context = context
     }
 
     func forwardRequests(_ requests: [RequestID: Request]) {
@@ -162,7 +165,7 @@ fileprivate class RequestLifetimeTracking<Request: Equatable, RequestID: Hashabl
                         lifetimeIdentifier: lifetime,
                         latestRequest: latestRequestSubject
                     )
-                    let requestsSubscription = self.effects(request, latestRequestSubject.asObservable())
+                    let requestsSubscription = self.effects(request, latestRequestSubject.asObservable(), self.context)
                         .observeOn(self.scheduler)
                         .subscribe { event in
                             self.state.async { state in
@@ -216,16 +219,17 @@ fileprivate class RequestLifetimeTracking<Request: Equatable, RequestID: Hashabl
  - parameter state: Latest request state.
  - returns: The feedback loop performing the effects.
  */
-public func react<State, Request: Equatable, RequestID, Event>(
+public func react<State, Request: Equatable, RequestID, Event, Context>(
     requests: @escaping (State) -> [RequestID: Request],
-    effects: @escaping (_ initial: Request, _ state: Observable<Request>) -> Observable<Event>
-) -> (ObservableSchedulerContext<State>) -> Observable<Event> {
-    return { stateContext in
+    effects: @escaping (_ initial: Request, _ state: Observable<Request>, _ context: Context) -> Observable<Event>
+) -> (ObservableSchedulerContext<State>, Context) -> Observable<Event> {
+    return { stateContext, context in
         Observable.create { observer in
-            let state = RequestLifetimeTracking<Request, RequestID, Event>(
+            let state = RequestLifetimeTracking<Request, RequestID, Event, Context>(
                 effects: effects,
                 scheduler: stateContext.scheduler,
-                observer: observer
+                observer: observer,
+                context: context
             )
 
             let subscription = stateContext.source
@@ -263,24 +267,25 @@ public func react<State, Request: Equatable, RequestID, Event>(
  - parameter state: Latest request state.
  - returns: The feedback loop performing the effects.
  */
-public func react<State, Request: Equatable, RequestID, Event>(
+public func react<State, Request: Equatable, RequestID, Event, Context>(
     requests: @escaping (State) -> [RequestID: Request],
-    effects: @escaping (_ initial: Request, _ state: Driver<Request>) -> Signal<Event>
-) -> (Driver<State>) -> Signal<Event> {
-    return { state in
+    effects: @escaping (_ initial: Request, _ state: Driver<Request>, _ context: Context) -> Signal<Event>
+) -> (Driver<State>, Context) -> Signal<Event> {
+    return { state, context in
         let observableSchedulerContext = ObservableSchedulerContext<State>(
             source: state.asObservable(),
             scheduler: Signal<Event>.SharingStrategy.scheduler.async
         )
         return react(
             requests: requests,
-            effects: { initial, state in
+            effects: { initial, state, context in
                 effects(
                     initial,
-                    state.asDriver(onErrorDriveWith: .empty())
+                    state.asDriver(onErrorDriveWith: .empty()),
+                    context
                 ).asObservable()
             }
-        )(observableSchedulerContext)
+            )(observableSchedulerContext, context)
             .asSignal(onErrorSignalWith: .empty())
     }
 }
@@ -335,8 +340,8 @@ public class Bindings<Event>: Disposable {
 /**
  Bi-directional binding of a system State to external state machine and events from it.
  */
-public func bind<State, Event>(_ bindings: @escaping (ObservableSchedulerContext<State>) -> (Bindings<Event>)) -> (ObservableSchedulerContext<State>) -> Observable<Event> {
-    return { (state: ObservableSchedulerContext<State>) -> Observable<Event> in
+public func bind<State, Event, Context>(_ bindings: @escaping (ObservableSchedulerContext<State>) -> (Bindings<Event>)) -> (ObservableSchedulerContext<State>, Context) -> Observable<Event> {
+    return { (state: ObservableSchedulerContext<State>, _) -> Observable<Event> in
         Observable<Event>.using(
             { () -> Bindings<Event> in
                 bindings(state)
@@ -354,16 +359,16 @@ public func bind<State, Event>(_ bindings: @escaping (ObservableSchedulerContext
  Bi-directional binding of a system State to external state machine and events from it.
  Strongify owner.
  */
-public func bind<State, Event, WeakOwner>(_ owner: WeakOwner, _ bindings: @escaping (WeakOwner, ObservableSchedulerContext<State>) -> (Bindings<Event>))
-    -> (ObservableSchedulerContext<State>) -> Observable<Event> where WeakOwner: AnyObject {
+public func bind<State, Event, WeakOwner, Context>(_ owner: WeakOwner, _ bindings: @escaping (WeakOwner, ObservableSchedulerContext<State>) -> (Bindings<Event>))
+    -> (ObservableSchedulerContext<State>, Context) -> Observable<Event> where WeakOwner: AnyObject {
     return bind(bindingsStrongify(owner, bindings))
 }
 
 /**
  Bi-directional binding of a system State to external state machine and events from it.
  */
-public func bind<State, Event>(_ bindings: @escaping (Driver<State>) -> (Bindings<Event>)) -> (Driver<State>) -> Signal<Event> {
-    return { (state: Driver<State>) -> Signal<Event> in
+public func bind<State, Event, Context>(_ bindings: @escaping (Driver<State>) -> (Bindings<Event>)) -> (Driver<State>, Context) -> Signal<Event> {
+    return { (state: Driver<State>, _) -> Signal<Event> in
         Observable<Event>.using(
             { () -> Bindings<Event> in
                 bindings(state)
@@ -380,8 +385,8 @@ public func bind<State, Event>(_ bindings: @escaping (Driver<State>) -> (Binding
  Bi-directional binding of a system State to external state machine and events from it.
  Strongify owner.
  */
-public func bind<State, Event, WeakOwner>(_ owner: WeakOwner, _ bindings: @escaping (WeakOwner, Driver<State>) -> (Bindings<Event>))
-    -> (Driver<State>) -> Signal<Event> where WeakOwner: AnyObject {
+public func bind<State, Event, WeakOwner, Context>(_ owner: WeakOwner, _ bindings: @escaping (WeakOwner, Driver<State>) -> (Bindings<Event>))
+    -> (Driver<State>, Context) -> Signal<Event> where WeakOwner: AnyObject {
     return bind(bindingsStrongify(owner, bindings))
 }
 
